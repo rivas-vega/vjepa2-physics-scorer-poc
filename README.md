@@ -4,7 +4,7 @@ This repository contains a Proof of Concept (PoC) for deploying Meta's **V-JEPA 
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```text
 ├── modal_app.py         # Main Modal deployment (GPU inference + FastAPI)
@@ -16,19 +16,19 @@ This repository contains a Proof of Concept (PoC) for deploying Meta's **V-JEPA 
 
 ---
 
-## 🔬 Physics Consistency Scoring (SurPrise)
+## Physics Consistency Scoring (SurPrise)
 
 The `surprise_scorer.py` implements the **SurPrise** metric (Violation of Expectation) to evaluate temporal coherence as a proxy for hallucination detection. 
 
 The core idea is based on the VoE (Violation of Expectation) paradigm:
-- **Temporally Coherent Videos** → Model exhibits **LOW** surprise.
-- **Incoherent/Hallucinated Videos** → Model exhibits **HIGH** surprise.
+- **Temporally Coherent Videos** -> Model exhibits **LOW** surprise.
+- **Incoherent/Hallucinated Videos** -> Model exhibits **HIGH** surprise.
 
 It uses a sliding-window approach over the V-JEPA 2 frame embeddings to measure how well the contextual frames can predict the target frames.
 
 ---
 
-## ⚡ Quick Start
+## Quick Start
 
 ### 1. Install Modal
 
@@ -58,7 +58,7 @@ curl -X POST https://<your-url>/download-model \
 
 ### 4. Run Inference & Scoring
 
-You can run the full pipeline (upload → preprocess → encode) directly via the API:
+You can run the full pipeline (upload -> preprocess -> encode) directly via the API:
 
 ```bash
 curl -X POST https://<your-url>/pipeline \
@@ -67,7 +67,7 @@ curl -X POST https://<your-url>/pipeline \
 
 ---
 
-## 🐍 Python Client
+## Python Client
 
 You can use the provided `client.py` SDK to interact with the deployed API:
 
@@ -87,7 +87,7 @@ print(f"Embedding dim: {len(embeddings[0])}")
 
 ---
 
-## 📖 References
+## References
 
 - [V-JEPA 2 Paper (Meta AI)](https://arxiv.org/abs/2506.09985)
 - [V-JEPA 2 GitHub](https://github.com/facebookresearch/vjepa2)
