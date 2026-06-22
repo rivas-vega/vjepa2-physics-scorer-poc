@@ -1,5 +1,5 @@
 """
-V-JEPA 2 + JEDi + SurPrise API — Python Client SDK
+V-JEPA 2 + SurPrise API — Python Client SDK
 ====================================================
 Convenience wrapper around the Modal-deployed REST API.
 
@@ -13,15 +13,6 @@ Quick example:
 
     # Check GPU health
     print(client.health())
-
-    # Upload and preprocess reference (real) videos
-    real_ids = [client.upload_and_preprocess(p) for p in ["real1.mp4", "real2.mp4"]]
-
-    # JEDi — score a generated video against the reference set
-    result = client.jedi_pipeline("generated.mp4", reference_video_ids=real_ids)
-    jedi = result["jedi"]
-    print(f"JEDi score    : {jedi['jedi_score']:.6f}")
-    print(f"Hallucination : {jedi['hallucination_level']} ({jedi['hallucination_score']:.1f}/100)")
 
     # SurPrise — temporal coherence score (no reference set needed)
     vid_id = client.upload_and_preprocess("video.mp4")
@@ -37,7 +28,10 @@ from typing import List, Optional
 
 
 class VJepa2Client:
-    """Synchronous HTTP client for the V-JEPA 2 + JEDi + SurPrise Modal API."""
+    """
+    Synchronous HTTP client for the V-JEPA 2 + SurPrise Modal API.
+    Handles communication with the FastAPI endpoints deployed on Modal.
+    """
 
     def __init__(self, base_url: str, api_key: str = "", timeout: int = 600):
         """
@@ -177,108 +171,6 @@ class VJepa2Client:
             },
         )
 
-    # ── JEDi ─────────────────────────────────────────────────────────────────
-
-    def jedi_score(
-        self,
-        generated_video_ids:  List[str],
-        reference_video_ids:  List[str],
-        kernel:               str  = "polynomial",
-        use_official_package: bool = True,
-    ) -> dict:
-        """
-        Compute JEDi (MMD²) hallucination score between two sets of videos.
-
-        All videos must already be uploaded and preprocessed.
-
-        Args:
-            generated_video_ids:  IDs of generated/evaluated videos.
-            reference_video_ids:  IDs of real/reference videos (min 2).
-            kernel:               "polynomial" | "rbf" | "multiscale_rbf"
-            use_official_package: Try the videojedi PyPI package first.
-
-        Returns:
-            dict with jedi_score, hallucination_level, hallucination_score,
-            interpretation, per_video_nn_distances, ...
-        """
-        return self._post_json("/jedi/score", {
-            "generated_video_ids":  generated_video_ids,
-            "reference_video_ids":  reference_video_ids,
-            "kernel":               kernel,
-            "use_official_package": use_official_package,
-        })
-
-    def jedi_build_corpus(
-        self,
-        video_ids:   List[str],
-        corpus_name: str = "default",
-    ) -> dict:
-        """
-        Pre-encode and persist reference videos as a named corpus.
-
-        Call once; then use jedi_score_corpus for fast repeated scoring
-        without re-encoding reference videos on every call.
-        """
-        return self._post_json("/jedi/corpus", {
-            "video_ids":   video_ids,
-            "corpus_name": corpus_name,
-        })
-
-    def jedi_list_corpora(self) -> dict:
-        """List all stored reference corpora with embedding counts."""
-        return self._get("/jedi/corpus")
-
-    def jedi_score_corpus(
-        self,
-        generated_video_ids: List[str],
-        corpus_name:         str = "default",
-        kernel:              str = "polynomial",
-    ) -> dict:
-        """
-        Score generated videos against a pre-stored corpus (fast path).
-
-        Avoids re-encoding reference videos on every call.
-        """
-        return self._post_json("/jedi/score-corpus", {
-            "generated_video_ids": generated_video_ids,
-            "corpus_name":         corpus_name,
-            "kernel":              kernel,
-        })
-
-    def jedi_pipeline(
-        self,
-        file_path:           str,
-        reference_video_ids: List[str],
-        num_frames:          int = 16,
-        frame_size:          int = 224,
-        sampling_mode:       str = "uniform",
-        kernel:              str = "polynomial",
-    ) -> dict:
-        """
-        All-in-one JEDi pipeline: upload → preprocess → encode → score.
-
-        Args:
-            file_path:           Path to the generated video file.
-            reference_video_ids: Already-uploaded & preprocessed reference IDs (min 2).
-            num_frames:          Frames to sample per clip.
-            frame_size:          Output square frame size (px).
-            sampling_mode:       "uniform" | "random" | "strided"
-            kernel:              MMD kernel for JEDi.
-
-        Returns:
-            dict with pipeline steps + full JEDi result under key "jedi".
-        """
-        return self._post_file(
-            "/jedi/pipeline",
-            file_path,
-            params={
-                "reference_video_ids": ",".join(reference_video_ids),
-                "kernel":              kernel,
-                "num_frames":          num_frames,
-                "frame_size":          frame_size,
-                "sampling_mode":       sampling_mode,
-            },
-        )
 
     # ── SurPrise ──────────────────────────────────────────────────────────────
 
@@ -419,44 +311,7 @@ class VJepa2Client:
         self.preprocess(video_id, num_frames=num_frames, frame_size=frame_size)
         return video_id
 
-    def evaluate_batch(
-        self,
-        generated_paths: List[str],
-        reference_paths: List[str],
-        num_frames:      int  = 16,
-        frame_size:      int  = 224,
-        build_corpus:    bool = True,
-        corpus_name:     str  = "default",
-    ) -> dict:
-        """
-        Full JEDi evaluation workflow:
-          1. Upload + preprocess reference videos → build corpus
-          2. Upload + preprocess generated videos
-          3. Score generated videos against the corpus
 
-        Returns:
-            JEDi result dict.
-        """
-        print(f"Uploading {len(reference_paths)} reference videos...")
-        ref_ids = [
-            self.upload_and_preprocess(p, num_frames=num_frames, frame_size=frame_size)
-            for p in reference_paths
-        ]
-
-        if build_corpus:
-            print(f"Building corpus '{corpus_name}'...")
-            self.jedi_build_corpus(ref_ids, corpus_name=corpus_name)
-
-        print(f"Uploading {len(generated_paths)} generated videos...")
-        gen_ids = [
-            self.upload_and_preprocess(p, num_frames=num_frames, frame_size=frame_size)
-            for p in generated_paths
-        ]
-
-        print("Computing JEDi score...")
-        if build_corpus:
-            return self.jedi_score_corpus(gen_ids, corpus_name=corpus_name)
-        return self.jedi_score(gen_ids, ref_ids)
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -465,7 +320,7 @@ if __name__ == "__main__":
     import sys, pprint
 
     USAGE = """
-V-JEPA 2 + JEDi + SurPrise Client CLI
+V-JEPA 2 + SurPrise Client CLI
 
 Usage:
   python client.py <base_url> <command> [args...]  [--key hyl_...]
@@ -480,16 +335,9 @@ Commands:
   videos
   delete <video_id>
 
-  jedi-score <gen_id1,gen_id2> <ref_id1,ref_id2,...>
-  jedi-corpus <ref_id1,ref_id2,...> [corpus_name]
-  jedi-score-corpus <gen_id1,gen_id2> [corpus_name]
-  jedi-pipeline <generated.mp4> <ref_id1,ref_id2,...>
-
   surprise-score <vid_id1,vid_id2,...>
   surprise-score-voe <possible_id1,...> <impossible_id1,...>
   surprise-pipeline <video.mp4>
-
-  evaluate <generated/*.mp4> -- <reference/*.mp4>
 
 Options:
   --key <api_key>   X-API-Key header value (or set HYLE_API_KEY env var)
@@ -543,34 +391,7 @@ Options:
     elif command == "delete":
         pprint.pprint(client.delete_video(rest[0]))
 
-    elif command == "jedi-score":
-        gen_ids = rest[0].split(",")
-        ref_ids = rest[1].split(",")
-        pprint.pprint(client.jedi_score(gen_ids, ref_ids))
 
-    elif command == "jedi-corpus":
-        ref_ids     = rest[0].split(",")
-        corpus_name = rest[1] if len(rest) > 1 else "default"
-        pprint.pprint(client.jedi_build_corpus(ref_ids, corpus_name=corpus_name))
-
-    elif command == "jedi-score-corpus":
-        gen_ids     = rest[0].split(",")
-        corpus_name = rest[1] if len(rest) > 1 else "default"
-        pprint.pprint(client.jedi_score_corpus(gen_ids, corpus_name=corpus_name))
-
-    elif command == "jedi-pipeline":
-        file_path = rest[0]
-        ref_ids   = rest[1].split(",")
-        result    = client.jedi_pipeline(file_path, reference_video_ids=ref_ids)
-        jedi      = result.get("jedi", {})
-        print(f"\n{'='*55}")
-        print(f"  JEDi Hallucination Report")
-        print(f"{'='*55}")
-        print(f"  Score      : {jedi.get('jedi_score', 'N/A'):.6f}")
-        print(f"  Level      : {jedi.get('hallucination_level', 'N/A').upper()}")
-        print(f"  Norm score : {jedi.get('hallucination_score', 'N/A'):.1f} / 100")
-        print(f"  Summary    : {jedi.get('interpretation', '')}")
-        print(f"{'='*55}\n")
 
     elif command == "surprise-score":
         vid_ids = rest[0].split(",")

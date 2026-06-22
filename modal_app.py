@@ -1,14 +1,8 @@
 """
-V-JEPA 2 + JEDi + SurPrise Deployment on Modal.com
+V-JEPA 2 + SurPrise Deployment on Modal.com
 =====================================================
 Full API server with video upload, preprocessing, V-JEPA 2 inference,
-and two complementary hallucination scoring metrics.
-
-JEDi — JEPA Embedding Distance (Luo et al., 2024 — arXiv:2410.05203):
-  • MMD² between generated and reference video embeddings
-  • 34% more aligned with human perception than FVD
-  • Converges with 16% of the samples FVD needs
-  • Sensitive to temporal distortions (I3D/FVD misses these)
+and the SurPrise hallucination scoring metric.
 
 SurPrise — Violation of Expectation metric (Garrido et al., 2025 — arXiv:2502.11831):
   • Measures temporal coherence via sliding-window V-JEPA 2 prediction error
@@ -28,8 +22,6 @@ app = modal.App("vjepa2-inference")
 # Persistent volumes
 model_volume  = modal.Volume.from_name("vjepa2-weights",    create_if_missing=True)
 video_volume  = modal.Volume.from_name("vjepa2-videos",     create_if_missing=True)
-jedi_volume   = modal.Volume.from_name("vjepa2-jedi-store", create_if_missing=True)
-admin_volume  = modal.Volume.from_name("hyle-admin-db",     create_if_missing=True)
 
 # Docker image
 image = (
@@ -83,9 +75,7 @@ image = (
         'pip install "hyle-surprice-metric-evaluator[all] @ git+https://${GITHUB_TOKEN}@github.com/EroPerez/hyle_surprise_metric_evaluator.git"',
         secrets=[modal.Secret.from_name("hyle-github")],
     )
-    .add_local_file("jedi_scorer.py",     "/opt/vjepa2_api/jedi_scorer.py",     copy=True)
     .add_local_file("surprise_scorer.py", "/opt/vjepa2_api/surprise_scorer.py", copy=True)
-    .add_local_dir("admin", "/opt/vjepa2_api/admin", copy=True)
     .env({"PYTHONPATH": "/opt/vjepa2_api"})
 )
 
@@ -397,165 +387,7 @@ class _VJepa2Base:
             "status":        "success",
         }
 
-    # ── JEDi: ad-hoc scoring ─────────────────────────────────────────────────
 
-    @modal.method()
-    def jedi_score(
-        self,
-        generated_video_ids: list,
-        reference_video_ids: list,
-        kernel: str = "polynomial",
-        use_official_package: bool = True,
-    ) -> dict:
-        """
-        Compute JEDi hallucination score between two sets of videos.
-
-        Encodes all videos → computes MMD² in V-JEPA embedding space.
-        Uses videojedi PyPI package if available, falls back to local MMD impl.
-        """
-        import numpy as np, sys
-        sys.path.insert(0, "/opt/vjepa2_api")
-
-        def _encode_batch(ids):
-            out    = []
-            failed = []
-            for vid_id in ids:
-                r = self.encode_video(vid_id)
-                if "error" in r:
-                    failed.append(vid_id)
-                    continue
-                emb = np.array(r["embeddings"], dtype=np.float32)
-                if emb.ndim == 2:
-                    emb = emb.mean(axis=0)
-                out.append(emb)
-            return out, failed
-
-        ref_embs_list, ref_failed = _encode_batch(reference_video_ids)
-        gen_embs_list, gen_failed = _encode_batch(generated_video_ids)
-
-        if len(ref_embs_list) < 2:
-            return {"error": "Need at least 2 encodeable reference videos.", "failed_reference": ref_failed}
-        if len(gen_embs_list) < 1:
-            return {"error": "No generated videos could be encoded.", "failed_generated": gen_failed}
-
-        ref_embs = np.stack(ref_embs_list)
-        gen_embs = np.stack(gen_embs_list)
-
-        # Try official videojedi PyPI first
-        official_score = None
-        official_used  = False
-        if use_official_package:
-            try:
-                jm                  = JEDiMetric()
-                jm.train_features   = ref_embs
-                jm.test_features    = gen_embs
-                official_score      = float(jm.compute_metric())
-                official_used       = True
-            except Exception:
-                pass
-
-        # Full detailed scoring (always run)
-        scorer = JEDiScorer(kernel=kernel, compute_nn_distances=True)
-        result = scorer.score(ref_embs, gen_embs)
-        output = result.to_dict()
-        output.update({
-            "reference_video_ids":      reference_video_ids,
-            "generated_video_ids":      generated_video_ids,
-            "failed_reference":         ref_failed,
-            "failed_generated":         gen_failed,
-            "official_videojedi_score": official_score,
-            "official_package_used":    official_used,
-            "metric":                   "JEDi — JEPA Embedding Distance (MMD²)",
-            "paper":                    "https://arxiv.org/abs/2410.05203",
-            "github":                   "https://github.com/oooolga/JEDi",
-        })
-        return output
-
-    # ── JEDi: corpus storage ─────────────────────────────────────────────────
-
-    @modal.method()
-    def store_reference_embeddings(self, video_ids: list, corpus_name: str = "default") -> dict:
-        """Pre-encode reference videos and persist embeddings for fast repeated scoring."""
-        import numpy as np
-
-        embeddings, failed = [], []
-        for vid_id in video_ids:
-            r = self.encode_video(vid_id)
-            if "error" in r:
-                failed.append(vid_id)
-                continue
-            emb = np.array(r["embeddings"], dtype=np.float32)
-            if emb.ndim == 2:
-                emb = emb.mean(axis=0)
-            embeddings.append(emb)
-
-        if not embeddings:
-            return {"error": "No videos could be encoded.", "failed": failed}
-
-        arr        = np.stack(embeddings)
-        store_path = Path(f"/jedi/corpus/{corpus_name}.npy")
-        store_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(str(store_path), arr)
-        jedi_volume.commit()
-
-        return {
-            "corpus_name":   corpus_name,
-            "n_stored":      arr.shape[0],
-            "embedding_dim": arr.shape[1],
-            "failed_ids":    failed,
-            "status":        "stored",
-        }
-
-    # ── JEDi: score against corpus ────────────────────────────────────────────
-
-    @modal.method()
-    def score_against_corpus(
-        self,
-        generated_video_ids: list,
-        corpus_name: str = "default",
-        kernel: str = "polynomial",
-    ) -> dict:
-        """Score generated videos against a pre-stored reference corpus (fast path)."""
-        import numpy as np, sys
-        sys.path.insert(0, "/opt/vjepa2_api")
-
-        corpus_path = Path(f"/jedi/corpus/{corpus_name}.npy")
-        if not corpus_path.exists():
-            available = [p.stem for p in Path("/jedi/corpus").glob("*.npy")] \
-                        if Path("/jedi/corpus").exists() else []
-            return {
-                "error":              f"Corpus '{corpus_name}' not found.",
-                "available_corpora":  available,
-            }
-
-        ref_embs = np.load(str(corpus_path))
-        gen_list, failed = [], []
-
-        for vid_id in generated_video_ids:
-            r = self.encode_video(vid_id)
-            if "error" in r:
-                failed.append(vid_id)
-                continue
-            emb = np.array(r["embeddings"], dtype=np.float32)
-            if emb.ndim == 2:
-                emb = emb.mean(axis=0)
-            gen_list.append(emb)
-
-        if not gen_list:
-            return {"error": "No generated videos could be encoded.", "failed": failed}
-
-        gen_embs = np.stack(gen_list)
-        scorer   = JEDiScorer(kernel=kernel, compute_nn_distances=True)
-        result   = scorer.score(ref_embs, gen_embs)
-        output   = result.to_dict()
-        output.update({
-            "corpus_name":         corpus_name,
-            "generated_video_ids": generated_video_ids,
-            "failed_ids":          failed,
-            "metric":              "JEDi — JEPA Embedding Distance (MMD²)",
-            "paper":               "https://arxiv.org/abs/2410.05203",
-        })
-        return output
 
     # ── SurPrise: predictor-based window encoder ─────────────────────────────
 
