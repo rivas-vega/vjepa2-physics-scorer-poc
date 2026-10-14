@@ -9,7 +9,7 @@ description = "Evaluation benchmark adapter for Video World Models (V-JEPA 2) on
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    { name = "Pedro Rivas Vega" }
+    { name = "rivas-vega" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

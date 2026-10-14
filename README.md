@@ -188,8 +188,6 @@ modal deploy modal_app.py
 
 ## 👤 Author
 
-**Pedro Rivas Vega**  
-*M2 MVA (Mathématiques, Vision, Apprentissage), École Normale Supérieure Paris-Saclay*  
-*B.S. in Mathematics, Universidad de Sevilla*  
-- GitHub: [@rivas-vega](https://github.com/rivas-vega)
-- Contact: [pedrorivasvega@gmail.com](mailto:pedrorivasvega@gmail.com)
+**Pedro** ([@rivas-vega](https://github.com/rivas-vega))  
+*M2 MVA, École Normale Supérieure Paris-Saclay*  
+*B.S. in Mathematics, Universidad de Sevilla*
