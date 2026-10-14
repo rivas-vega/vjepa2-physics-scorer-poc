@@ -125,11 +125,16 @@ def score_frame_sequence(
     Returns:
         SurpriseResult with full scoring breakdown.
     """
-    from hyle_surprise_metric import (
-        SurpriseEvaluator,
-        SlidingWindowExtractor,
-        prepare_video_from_sequence,
-    )
+    # Check if external library is available, otherwise use native NumPy implementation
+    try:
+        from hyle_surprise_metric import (
+            SurpriseEvaluator,
+            SlidingWindowExtractor,
+            prepare_video_from_sequence,
+        )
+        use_external = True
+    except ImportError:
+        use_external = False
 
     th  = thresholds or _DEFAULT_THRESHOLDS
     arr = np.asarray(frame_embeddings, dtype=np.float32)
@@ -153,29 +158,46 @@ def score_frame_sequence(
             interpretation=_INTERPRETATIONS[level], thresholds=th,
         )
 
-    evaluator = SurpriseEvaluator(
-        distance_metric=distance_metric,
-        aggregation_mode=aggregation_mode,
-    )
-    extractor = SlidingWindowExtractor(
-        window_size=window_size,
-        context_length=context_length,
-        stride=stride,
-    )
+    if use_external:
+        evaluator = SurpriseEvaluator(
+            distance_metric=distance_metric,
+            aggregation_mode=aggregation_mode,
+        )
+        extractor = SlidingWindowExtractor(
+            window_size=window_size,
+            context_length=context_length,
+            stride=stride,
+        )
 
-    # Use the same sequence for predicted and observed.
-    # The library's windowing creates (context, target) pairs within each window,
-    # measuring how well early frames "predict" later ones — temporal coherence proxy.
-    video = prepare_video_from_sequence(
-        video_id="vjepa2_encode",
-        predicted_sequence=arr,
-        observed_sequence=arr,
-        extractor=extractor,
-    )
+        # Use the same sequence for predicted and observed.
+        video = prepare_video_from_sequence(
+            video_id="vjepa2_encode",
+            predicted_sequence=arr,
+            observed_sequence=arr,
+            extractor=extractor,
+        )
 
-    avg_score, window_scores = evaluator.compute_video_surprise(
-        video.predicted, video.observed
-    )
+        avg_score, window_scores = evaluator.compute_video_surprise(
+            video.predicted, video.observed
+        )
+    else:
+        # Native NumPy implementation: extract sliding windows (context, target)
+        window_scores = []
+        t = 0
+        while t + window_size <= n_frames:
+            ctx = arr[t : t + context_length].mean(axis=0)
+            tgt = arr[t + context_length : t + window_size].mean(axis=0)
+            if distance_metric == "l2":
+                dist = float(np.sqrt(np.sum((ctx - tgt) ** 2)))
+            elif distance_metric == "cosine":
+                denom = float(np.linalg.norm(ctx) * np.linalg.norm(tgt)) + 1e-9
+                dist = float(1.0 - np.dot(ctx, tgt) / denom)
+            else:  # l1
+                dist = float(np.mean(np.abs(ctx - tgt)))
+            window_scores.append(dist)
+            t += stride
+
+        avg_score = float(np.mean(window_scores)) if window_scores else 0.0
     max_score   = float(max(window_scores)) if window_scores else float(avg_score)
     main_score  = max_score if aggregation_mode == "maximum" else float(avg_score)
     level, norm = _classify(main_score, th)
@@ -201,7 +223,7 @@ def score_frame_sequence(
 def score_predictor_windows(
     predicted_windows: np.ndarray,
     observed_windows:  np.ndarray,
-    n_frames:          int,
+    n_frames:          int            = 0,
     distance_metric:   str            = "l1",
     aggregation_mode:  str            = "average",
     thresholds:        Optional[dict] = None,
@@ -285,3 +307,58 @@ def score_predictor_windows(
         interpretation=_INTERPRETATIONS[level],
         thresholds=th,
     )
+
+
+# ── Dataset-level VoE evaluation ──────────────────────────────────────────────
+
+@dataclass
+class VoEDatasetResult:
+    """Result of Violation-of-Expectation pairwise dataset evaluation."""
+    accuracy:        float
+    n_correct:       int
+    n_pairs:         int
+    possible_mean:   float
+    impossible_mean: float
+
+
+def evaluate_voe_dataset(
+    possible_scores:   List[float],
+    impossible_scores: List[float],
+) -> VoEDatasetResult:
+    """
+    Evaluate Violation-of-Expectation (VoE) pairwise accuracy.
+
+    For paired physical evaluation (e.g. IntPhys / VoE benchmarks):
+    An instance is correct if the physically impossible sequence incurs
+    strictly higher surprise than its physically possible counterpart.
+
+    Supports both 1:1 paired lists (equal lengths) and all-pairs evaluation.
+    """
+    poss = [float(s) for s in possible_scores]
+    imp  = [float(s) for s in impossible_scores]
+
+    if not poss or not imp:
+        return VoEDatasetResult(
+            accuracy=0.0, n_correct=0, n_pairs=0,
+            possible_mean=float(np.mean(poss)) if poss else 0.0,
+            impossible_mean=float(np.mean(imp)) if imp else 0.0,
+        )
+
+    # 1:1 paired comparison if equal length, else Cartesian product
+    if len(poss) == len(imp):
+        n_pairs = len(poss)
+        n_correct = sum(1 for p, i in zip(poss, imp) if i > p)
+    else:
+        n_pairs = len(poss) * len(imp)
+        n_correct = sum(1 for p in poss for i in imp if i > p)
+
+    accuracy = float(n_correct / n_pairs) if n_pairs > 0 else 0.0
+
+    return VoEDatasetResult(
+        accuracy=accuracy,
+        n_correct=n_correct,
+        n_pairs=n_pairs,
+        possible_mean=float(np.mean(poss)),
+        impossible_mean=float(np.mean(imp)),
+    )
+

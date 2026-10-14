@@ -68,13 +68,7 @@ image = (
         "cd /opt/vjepa2 && pip install -e . --no-deps || true",
         "mkdir -p /opt/vjepa2_api",
     )
-    .run_commands(
-        # Install private hyle-surprice-metric-evaluator from GitHub.
-        # Requires GITHUB_TOKEN secret (modal secret create hyle-github GITHUB_TOKEN=<pat>).
-        # The token needs read access to EroPerez/hyle_surprise_metric_evaluator.
-        'pip install "hyle-surprice-metric-evaluator[all] @ git+https://${GITHUB_TOKEN}@github.com/EroPerez/hyle_surprise_metric_evaluator.git"',
-        secrets=[modal.Secret.from_name("hyle-github")],
-    )
+    # surprise_scorer is fully self-contained and copied into the image
     .add_local_file("surprise_scorer.py", "/opt/vjepa2_api/surprise_scorer.py", copy=True)
     .env({"PYTHONPATH": "/opt/vjepa2_api"})
 )
@@ -587,7 +581,9 @@ class _VJepa2Base:
         ), None
 
     def _surprise_voe_pair(self, possible_video_ids, impossible_video_ids, distance_metric, aggregation_mode, window_size, context_length, stride):
-        from hyle_surprise_metric import SurpriseEvaluator
+        import sys
+        sys.path.insert(0, "/opt/vjepa2_api")
+        from surprise_scorer import evaluate_voe_dataset
 
         def _collect(ids):
             scores, failed = [], []
@@ -607,9 +603,7 @@ class _VJepa2Base:
                 "impossible_failed": imp_failed,
             }
 
-        dataset_result = SurpriseEvaluator(
-            distance_metric=distance_metric, aggregation_mode=aggregation_mode
-        ).evaluate_dataset(poss_scores, imp_scores)
+        dataset_result = evaluate_voe_dataset(poss_scores, imp_scores)
 
         return {
             "mode":                "voe_pair",
@@ -711,7 +705,7 @@ class _VJepa2Base:
 
 _CLS_KWARGS = dict(
     image=image,
-    volumes={"/weights": model_volume, "/videos": video_volume, "/jedi": jedi_volume},
+    volumes={"/weights": model_volume, "/videos": video_volume},
     timeout=600,
     scaledown_window=120,
 )
@@ -719,12 +713,12 @@ _CLS_KWARGS = dict(
 
 @app.cls(gpu=GPU_CONFIG_STANDARD, **_CLS_KWARGS)
 class VJepa2ModelStandard(_VJepa2Base):
-    """Standard GPU tier (A10G) — Free, Pay-per-Minute, Starter plans."""
+    """Standard GPU tier (A10G)."""
 
 
 @app.cls(gpu=GPU_CONFIG_PREMIUM, **_CLS_KWARGS)
 class VJepa2ModelPremium(_VJepa2Base):
-    """Premium GPU tier (A100-40GB) — Professional, Enterprise plans."""
+    """Premium GPU tier (A100-40GB)."""
 
 
 # ─── FastAPI Server ────────────────────────────────────────────────────────────
@@ -732,15 +726,12 @@ class VJepa2ModelPremium(_VJepa2Base):
 @app.function(
     image=image,
     volumes={
-        "/weights":   model_volume,
-        "/videos":    video_volume,
-        "/jedi":      jedi_volume,
-        "/admin-db":  admin_volume,
+        "/weights": model_volume,
+        "/videos":  video_volume,
     },
     timeout=900,
     cpu=2,
     memory=4096,
-    secrets=[modal.Secret.from_name("hyle-admin-secret")],
 )
 @modal.asgi_app()
 def api_server():
@@ -757,29 +748,14 @@ def api_server():
     api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
 
     api = FastAPI(
-        title="V-JEPA 2 + JEDi + SurPrise API",
+        title="V-JEPA 2 Physics & SurPrise Scorer API",
         description=(
-            "## V-JEPA 2 Inference + JEDi & SurPrise Hallucination Scoring\n\n"
-            "Upload videos, extract V-JEPA 2 embeddings, and measure hallucination quality "
-            "using two complementary metrics:\n\n"
-            "- **JEDi** ([Luo et al., 2024](https://arxiv.org/abs/2410.05203)) — "
-            "MMD² between generated and reference video embeddings; 34% more aligned with "
-            "human perception than FVD.\n"
+            "## V-JEPA 2 Physical Violation-of-Expectation (VoE) & SurPrise Scorer\n\n"
+            "Extract V-JEPA 2 representations and score physical violation-of-expectation\n"
+            "and temporal consistency across synthetic or real video sequences.\n\n"
             "- **SurPrise** ([Garrido et al., 2025](https://arxiv.org/abs/2502.11831)) — "
             "Violation-of-Expectation metric measuring temporal coherence via sliding-window "
-            "V-JEPA 2 prediction error. No reference set needed.\n\n"
-            "### Authentication\n"
-            "All endpoints (except `/health` and `/docs`) require an API key:\n"
-            "```\nX-API-Key: hyl_...\n```\n"
-            "Obtain a key from your admin at `/admin/dashboard`.\n\n"
-            "### JEDi Score Levels\n"
-            "| MMD² | Level | Meaning |\n"
-            "|------|-------|---------|\n"
-            "| < 0.001 | 🟢 **None** | Indistinguishable from real |\n"
-            "| 0.001–0.005 | 🟡 **Low** | Minor temporal/spatial artifacts |\n"
-            "| 0.005–0.02 | 🟠 **Moderate** | Noticeable hallucinations |\n"
-            "| 0.02–0.08 | 🔴 **High** | Significant hallucinations |\n"
-            "| > 0.08 | 🚨 **Severe** | Far outside real distribution |\n\n"
+            "V-JEPA 2 prediction error.\n\n"
             "### SurPrise Score Levels\n"
             "| surprise_score (L1) | Level | Meaning |\n"
             "|---------------------|-------|---------|\n"
@@ -794,9 +770,13 @@ def api_server():
         version="2.0.0",
         docs_url="/docs",
         redoc_url="/redoc",
-        openapi_tags=[{"name": "Info"}, {"name": "Setup"}, {"name": "Video"},
-                      {"name": "Inference"}, {"name": "JEDi — Hallucination Scoring"},
-                      {"name": "SurPrise — Hallucination Scoring"}, {"name": "Admin"}],
+        openapi_tags=[
+            {"name": "Info"},
+            {"name": "Setup"},
+            {"name": "Video"},
+            {"name": "Inference"},
+            {"name": "SurPrise — VoE Scoring"},
+        ],
     )
 
     def custom_openapi():
@@ -809,31 +789,20 @@ def api_server():
             routes=api.routes,
             tags=api.openapi_tags,
         )
-        # Register both security schemes
         schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
         schemes["ApiKeyAuth"] = {
             "type": "apiKey",
             "in": "header",
             "name": "X-API-Key",
-            "description": "API key for all endpoints. Obtain from `/admin/dashboard`. Format: `hyl_...`",
+            "description": "API key for endpoints. Set via VJEP2_API_KEY environment variable.",
         }
-        schemes["AdminTokenAuth"] = {
-            "type": "apiKey",
-            "in": "header",
-            "name": "X-Admin-Token",
-            "description": "Admin token for `/admin/*` endpoints. Set via Modal secret `hyle-admin-secret`.",
-        }
-        # Apply per-path: admin routes get AdminTokenAuth, everything else gets ApiKeyAuth
-        _public = {"/", "/health", "/docs", "/redoc", "/openapi.json",
-                   "/admin/dashboard", "/admin/"}
+        _public = {"/", "/health", "/docs", "/redoc", "/openapi.json"}
         for path, path_item in schema.get("paths", {}).items():
             for operation in path_item.values():
                 if not isinstance(operation, dict):
                     continue
                 if path in _public:
-                    operation["security"] = []          # no auth badge
-                elif path.startswith("/admin"):
-                    operation["security"] = [{"AdminTokenAuth": []}]
+                    operation["security"] = []
                 else:
                     operation.setdefault("security", [{"ApiKeyAuth": []}])
         api.openapi_schema = schema
@@ -848,137 +817,28 @@ def api_server():
         allow_headers=["*"],
     )
 
-    # ── Admin router ──────────────────────────────────────────────────────────
-    get_engine()   # initialise DB + run migrations on cold start
-    public_admin, protected_admin = build_admin_router(admin_volume)
-    api.include_router(public_admin,    prefix="/admin")
-    api.include_router(protected_admin, prefix="/admin")
-
-    # ── Payment router ────────────────────────────────────────────────────────
-    pub_pay, prot_pay = build_payment_router(admin_volume)
-    api.include_router(pub_pay)                  # /payments/*
-    api.include_router(prot_pay, prefix="/admin") # /admin/payments/*
-
-    # ── Auth + billing middleware ─────────────────────────────────────────────
+    # ── Optional API Key Middleware ───────────────────────────────────────────
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request as StarletteRequest
     from starlette.responses import JSONResponse as StarletteJSONResponse
-    from datetime import datetime, timezone as _tz
+    import os
 
-    # Paths that bypass API-key auth entirely
     _PUBLIC_PATHS = {"/", "/health", "/docs", "/redoc", "/openapi.json"}
+    API_KEY = os.environ.get("VJEP2_API_KEY", "")
 
-    # Endpoints that consume video processing time and are billed
-    _BILLED_ENDPOINTS = {
-        "/preprocess",
-        "/encode",
-        "/pipeline",
-        "/jedi/score",
-        "/jedi/corpus",
-        "/jedi/score-corpus",
-        "/jedi/pipeline",
-        "/surprise/score",
-        "/surprise/pipeline",
-    }
-
-    class AuthAndBillingMiddleware(BaseHTTPMiddleware):
+    class ApiKeyMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: StarletteRequest, call_next):
-            path = request.url.path
-
-            # Always allow: public info pages, admin routes (have own auth), CORS preflight
-            if (
-                request.method == "OPTIONS"
-                or path in _PUBLIC_PATHS
-                or path.startswith("/admin")
-                or path.startswith("/payments")
-            ):
+            if request.method == "OPTIONS" or request.url.path in _PUBLIC_PATHS or not API_KEY:
                 return await call_next(request)
-
-            # ── 1. API key validation ─────────────────────────────────────────
             raw_key = request.headers.get("X-API-Key")
-            if not raw_key:
+            if not raw_key or raw_key != API_KEY:
                 return StarletteJSONResponse(
-                    {"detail": "Missing X-API-Key header."},
+                    {"detail": "Invalid or missing X-API-Key header."},
                     status_code=401,
                 )
+            return await call_next(request)
 
-            db = get_session()
-            try:
-                api_key = lookup_api_key(db, raw_key)
-                if not api_key or not api_key.is_active:
-                    return StarletteJSONResponse(
-                        {"detail": "Invalid or revoked API key."},
-                        status_code=401,
-                    )
-
-                # ── 2. Quota enforcement for hard-cap plans (e.g. free tier) ─
-                is_billed = any(path.endswith(ep) for ep in _BILLED_ENDPOINTS)
-                if is_billed:
-                    user = db.get(_User, api_key.user_id)
-                    if user:
-                        plan = _PLANS.get(user.plan_id, _PLANS["free"])
-                        # Hard cap: plan has a minute limit but zero overage price
-                        if (
-                            plan.included_minutes is not None
-                            and plan.overage_price_per_minute == 0.0
-                            and plan.included_minutes > 0
-                        ):
-                            now         = datetime.now(_tz.utc).replace(tzinfo=None)
-                            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-                            used = _monthly_minutes(db, api_key.user_id, month_start)
-                            if used >= plan.included_minutes:
-                                return StarletteJSONResponse(
-                                    {
-                                        "detail": (
-                                            f"Monthly limit reached: {plan.included_minutes} min "
-                                            f"included in the {plan.name} plan. "
-                                            "Upgrade your plan at /admin/dashboard."
-                                        ),
-                                        "plan_id":          plan.id,
-                                        "included_minutes": plan.included_minutes,
-                                        "used_minutes":     round(used, 3),
-                                    },
-                                    status_code=429,
-                                )
-
-                # ── 3. Stamp auth context onto request state ──────────────────
-                request.state.user_id    = api_key.user_id
-                request.state.api_key_id = api_key.id
-                # Resolve GPU tier once per request so endpoints don't hit the DB
-                if user is None:
-                    user = db.get(_User, api_key.user_id)
-                _plan = _PLANS.get(user.plan_id, _PLANS["free"]) if user else _PLANS["free"]
-                request.state.priority_gpu = _plan.priority_gpu
-                api_key.last_used_at = datetime.now(_tz.utc).replace(tzinfo=None)
-
-                # ── 4. Process the request ────────────────────────────────────
-                response = await call_next(request)
-
-                # ── 5. Record usage from billing state set by the endpoint ────
-                if is_billed:
-                    minutes  = getattr(request.state, "billing_minutes",  0.0)
-                    video_id = getattr(request.state, "billing_video_id", None)
-                    if minutes and minutes > 0:
-                        record_usage(
-                            db=db,
-                            user_id=api_key.user_id,
-                            endpoint=path,
-                            video_minutes=float(minutes),
-                            video_id=video_id,
-                            api_key_id=api_key.id,
-                        )
-                        admin_volume.commit()
-                        return response
-
-                db.commit()
-                return response
-
-            except Exception:
-                pass  # never break the main API
-            finally:
-                db.close()
-
-    api.add_middleware(AuthAndBillingMiddleware)
+    api.add_middleware(ApiKeyMiddleware)
 
     # ── Pydantic Models ───────────────────────────────────────────────────────
 
@@ -1001,33 +861,6 @@ def api_server():
             "vjepa2-vith-fpc64-256",
             "vjepa2-vitg-fpc64-256",
         ] = "vjepa2-vitl-fpc64-256"
-
-    class JEDiScoreRequest(BaseModel):
-        generated_video_ids:  List[str] = Field(
-            ..., description="IDs of generated/evaluated videos (already uploaded & preprocessed)"
-        )
-        reference_video_ids:  List[str] = Field(
-            ..., min_length=2, description="IDs of real reference videos (min 2)"
-        )
-        kernel: Literal["polynomial", "rbf", "multiscale_rbf"] = Field(
-            "polynomial",
-            description=(
-                "MMD kernel. **polynomial** (default, matches official JEDi paper), "
-                "**rbf**, or **multiscale_rbf**."
-            ),
-        )
-        use_official_package: bool = Field(
-            True, description="Try videojedi PyPI package for official JEDi score"
-        )
-
-    class JEDiCorpusRequest(BaseModel):
-        video_ids:   List[str] = Field(..., min_length=2, description="Reference video IDs")
-        corpus_name: str       = Field("default")
-
-    class JEDiCorpusScoreRequest(BaseModel):
-        generated_video_ids: List[str] = Field(..., description="Generated video IDs")
-        corpus_name:         str       = Field("default")
-        kernel:              Literal["polynomial", "rbf", "multiscale_rbf"] = "polynomial"
 
     class SurpriseScoreRequest(BaseModel):
         video_ids: List[str] = Field(
@@ -1061,59 +894,16 @@ def api_server():
             raise HTTPException(400, f"Unsupported format: {suffix}")
         content = await file.read()
 
-        # ── Plan-based limits ─────────────────────────────────────────────────
-        import json as _json
-        user_id = getattr(request.state, "user_id", None)
-        plan    = _PLANS["free"]
-        if user_id:
-            db = get_session()
-            try:
-                user = db.get(_User, user_id)
-                if user:
-                    plan = _PLANS.get(user.plan_id, _PLANS["free"])
-            finally:
-                db.close()
-
         size_mb = len(content) / 1024 / 1024
-        if size_mb > plan.max_video_size_mb:
+        if size_mb > 500.0:
             raise HTTPException(
                 413,
-                {
-                    "detail":            f"File too large: {size_mb:.1f} MB exceeds the {plan.max_video_size_mb} MB limit for the {plan.name} plan.",
-                    "plan_id":           plan.id,
-                    "max_video_size_mb": plan.max_video_size_mb,
-                    "file_size_mb":      round(size_mb, 2),
-                },
+                f"File too large: {size_mb:.1f} MB exceeds the 500 MB limit.",
             )
-
-        # Count videos already owned by this user
-        if user_id:
-            videos_root = Path("/videos")
-            owned = 0
-            if videos_root.exists():
-                for d in videos_root.iterdir():
-                    owner_file = d / "owner.json"
-                    if owner_file.exists():
-                        try:
-                            if _json.loads(owner_file.read_text()).get("user_id") == user_id:
-                                owned += 1
-                        except Exception:
-                            pass
-            if owned >= plan.max_videos_stored:
-                raise HTTPException(
-                    429,
-                    {
-                        "detail":             f"Storage limit reached: {plan.max_videos_stored} videos allowed on the {plan.name} plan. Delete unused videos or upgrade.",
-                        "plan_id":            plan.id,
-                        "max_videos_stored":  plan.max_videos_stored,
-                        "current_stored":     owned,
-                    },
-                )
 
         video_id = str(uuid.uuid4())
         raw_dir  = Path(f"/videos/{video_id}")
         raw_dir.mkdir(parents=True, exist_ok=True)
-        (raw_dir / "owner.json").write_text(_json.dumps({"user_id": user_id}))
         async with aiofiles.open(str(raw_dir / f"raw{suffix}"), "wb") as f:
             await f.write(content)
         video_volume.commit()
@@ -1124,22 +914,14 @@ def api_server():
     @api.get("/", tags=["Info"])
     async def root():
         return {
-            "service": "V-JEPA 2 + JEDi API",
+            "service": "V-JEPA 2 Physics & SurPrise Scorer API",
             "version": "2.0.0",
-            "jedi_paper": "https://arxiv.org/abs/2410.05203",
             "endpoints": {
                 "Setup":        ["POST /download-model", "GET /health"],
                 "Video":        ["POST /upload", "POST /preprocess", "GET /videos", "DELETE /videos/{id}"],
                 "Inference":    ["POST /encode", "POST /pipeline"],
-                "JEDi":         [
-                    "POST /jedi/score          — ad-hoc: score generated vs reference videos",
-                    "POST /jedi/corpus         — store reference corpus (one-time)",
-                    "GET  /jedi/corpus         — list stored corpora",
-                    "POST /jedi/score-corpus   — score against pre-stored corpus (fast)",
-                    "POST /jedi/pipeline       — upload → preprocess → encode → JEDi in one call",
-                ],
                 "SurPrise":     [
-                    "POST /surprise/score      — temporal coherence score (single-video or VoE pair mode)",
+                    "POST /surprise/score      — temporal surprise & VoE pairwise accuracy",
                     "POST /surprise/pipeline   — upload → preprocess → encode → SurPrise in one call",
                 ],
                 "Docs":         ["GET /docs", "GET /redoc"],
@@ -1171,7 +953,7 @@ def api_server():
             "filename": file.filename,
             "size_mb":  round(len(content) / 1024 / 1024, 2),
             "status":   "uploaded",
-            "next":     "POST /preprocess or POST /jedi/pipeline",
+            "next":     "POST /preprocess or POST /surprise/pipeline",
         }
 
     @api.post("/preprocess", tags=["Video"])
@@ -1312,197 +1094,11 @@ def api_server():
             "encode":     encode_r,
         }
 
-    # ── JEDi Endpoints ───────────────────────────────────────────────────────
-
-    @api.post(
-        "/jedi/score",
-        tags=["JEDi — Hallucination Scoring"],
-        summary="Score generated videos vs reference videos (ad-hoc)",
-        description=(
-            "Compute the **JEDi** metric between two sets of already-uploaded & preprocessed videos.\n\n"
-            "Internally: encodes all videos with V-JEPA 2 → MMD² in embedding space.\n\n"
-            "**Returns:**\n"
-            "- `jedi_score` — raw MMD² (lower = less hallucination)\n"
-            "- `jedi_sqrt` — √MMD (same units as embedding distance)\n"
-            "- `hallucination_level` — none / low / moderate / high / severe\n"
-            "- `hallucination_score` — 0–100 normalised (0 = pristine)\n"
-            "- `per_video_nn_distances` — cosine distance to nearest reference per video\n"
-            "- `official_videojedi_score` — score from videojedi PyPI (if available)\n"
-        ),
-    )
-    async def jedi_score(request: Request, req: JEDiScoreRequest):
-        model  = (VJepa2ModelPremium if getattr(request.state, "priority_gpu", False) else VJepa2ModelStandard)()
-        result = await model.jedi_score.remote.aio(
-            generated_video_ids=req.generated_video_ids,
-            reference_video_ids=req.reference_video_ids,
-            kernel=req.kernel,
-            use_official_package=req.use_official_package,
-        )
-        if "error" in result:
-            raise HTTPException(422, result["error"])
-        import json as _json
-        all_ids = req.generated_video_ids + req.reference_video_ids
-        minutes = 0.0
-        for vid in all_ids:
-            meta_path = Path(f"/videos/{vid}/metadata.json")
-            if meta_path.exists():
-                minutes += _json.loads(meta_path.read_text()).get("video_duration_minutes", 0.0)
-        request.state.billing_minutes = minutes
-        return result
-
-    @api.post(
-        "/jedi/corpus",
-        tags=["JEDi — Hallucination Scoring"],
-        summary="Build & store a reference corpus (one-time setup)",
-        description=(
-            "Pre-encodes reference videos and persists their V-JEPA 2 embeddings "
-            "in a named corpus on the Modal Volume.\n\n"
-            "Call once. Then use `POST /jedi/score-corpus` for fast scoring "
-            "without re-encoding references every time."
-        ),
-    )
-    async def jedi_build_corpus(request: Request, req: JEDiCorpusRequest):
-        model  = (VJepa2ModelPremium if getattr(request.state, "priority_gpu", False) else VJepa2ModelStandard)()
-        result = await model.store_reference_embeddings.remote.aio(
-            video_ids=req.video_ids,
-            corpus_name=req.corpus_name,
-        )
-        if "error" in result:
-            raise HTTPException(422, result["error"])
-        import json as _json
-        minutes = 0.0
-        for vid in req.video_ids:
-            meta_path = Path(f"/videos/{vid}/metadata.json")
-            if meta_path.exists():
-                minutes += _json.loads(meta_path.read_text()).get("video_duration_minutes", 0.0)
-        request.state.billing_minutes = minutes
-        return result
-
-    @api.get(
-        "/jedi/corpus",
-        tags=["JEDi — Hallucination Scoring"],
-        summary="List stored reference corpora",
-    )
-    async def list_corpora():
-        """List all stored reference corpora and their sizes."""
-        import numpy as np
-        corpus_dir = Path("/jedi/corpus")
-        if not corpus_dir.exists():
-            return {"corpora": [], "count": 0}
-        corpora = []
-        for p in sorted(corpus_dir.glob("*.npy")):
-            arr = np.load(str(p))
-            corpora.append({
-                "corpus_name":   p.stem,
-                "n_embeddings":  arr.shape[0],
-                "embedding_dim": arr.shape[1],
-                "size_mb":       round(p.stat().st_size / 1024 / 1024, 3),
-            })
-        return {"corpora": corpora, "count": len(corpora)}
-
-    @api.post(
-        "/jedi/score-corpus",
-        tags=["JEDi — Hallucination Scoring"],
-        summary="Score generated videos against a pre-stored corpus (fast path)",
-        description=(
-            "Like `POST /jedi/score` but uses a pre-built corpus instead of "
-            "re-encoding reference videos on every call. Much faster for "
-            "repeated evaluations against the same reference set."
-        ),
-    )
-    async def jedi_score_corpus(request: Request, req: JEDiCorpusScoreRequest):
-        model  = (VJepa2ModelPremium if getattr(request.state, "priority_gpu", False) else VJepa2ModelStandard)()
-        result = await model.score_against_corpus.remote.aio(
-            generated_video_ids=req.generated_video_ids,
-            corpus_name=req.corpus_name,
-            kernel=req.kernel,
-        )
-        if "error" in result:
-            raise HTTPException(422, result["error"])
-        import json as _json
-        minutes = 0.0
-        for vid in req.generated_video_ids:
-            meta_path = Path(f"/videos/{vid}/metadata.json")
-            if meta_path.exists():
-                minutes += _json.loads(meta_path.read_text()).get("video_duration_minutes", 0.0)
-        request.state.billing_minutes = minutes
-        return result
-
-    @api.post(
-        "/jedi/pipeline",
-        tags=["JEDi — Hallucination Scoring"],
-        summary="Full JEDi pipeline: upload → preprocess → encode → score",
-        description=(
-            "All-in-one endpoint. Upload a **generated** video and immediately get "
-            "its JEDi hallucination score against already-uploaded reference videos.\n\n"
-            "Pass `reference_video_ids` as a comma-separated query parameter.\n\n"
-            "**Steps internally:**\n"
-            "1. Upload & save generated video\n"
-            "2. Preprocess (decode frames, crop, sample, normalise)\n"
-            "3. Encode with V-JEPA 2\n"
-            "4. Compute JEDi (MMD² vs reference embeddings)\n"
-            "5. Return hallucination level, score, and full breakdown"
-        ),
-    )
-    async def jedi_full_pipeline(
-        request: Request,
-        file: UploadFile = File(...),
-        reference_video_ids: str = Query(
-            ...,
-            description="Comma-separated reference video IDs (already uploaded & preprocessed, min 2)",
-        ),
-        config_json: str = Form(default="{}"),
-        kernel: Literal["polynomial", "rbf", "multiscale_rbf"] = Query("polynomial"),
-    ):
-        import json as _json
-        try:
-            config = PreprocessConfig(**_json.loads(config_json))
-        except Exception:
-            config = PreprocessConfig()
-        ref_ids = [r.strip() for r in reference_video_ids.split(",") if r.strip()]
-        if len(ref_ids) < 2:
-            raise HTTPException(400, "Provide at least 2 reference_video_ids.")
-
-        # 1. Upload
-        video_id, _, _ = await _save_upload(file, request)
-        raw_files      = list(Path(f"/videos/{video_id}").glob("raw.*"))
-
-        # 2. Preprocess
-        preprocess_r = await preprocess_video.remote.aio(
-            video_bytes=raw_files[0].read_bytes(),
-            video_id=video_id,
-            config=config.model_dump(),
-        )
-        request.state.billing_minutes  = preprocess_r.get("video_duration_minutes", 0.0)
-        request.state.billing_video_id = video_id
-
-        # 3 & 4. Encode + JEDi
-        model       = (VJepa2ModelPremium if getattr(request.state, "priority_gpu", False) else VJepa2ModelStandard)()
-        jedi_result = await model.jedi_score.remote.aio(
-            generated_video_ids=[video_id],
-            reference_video_ids=ref_ids,
-            kernel=kernel,
-            use_official_package=True,
-        )
-
-        if "error" in jedi_result:
-            raise HTTPException(503, jedi_result["error"])
-
-        return {
-            "pipeline":         "upload → preprocess → encode → JEDi score",
-            "generated_video":  {
-                "video_id":  video_id,
-                "filename":  file.filename,
-                "preprocess": preprocess_r,
-            },
-            "jedi":             jedi_result,
-        }
-
     # ── SurPrise Endpoints ────────────────────────────────────────────────────
 
     @api.post(
         "/surprise/score",
-        tags=["SurPrise — Hallucination Scoring"],
+        tags=["SurPrise — VoE Scoring"],
         summary="SurPrise temporal coherence score (single-video or VoE pair mode)",
         description=(
             "Compute the **SurPrise** metric from *'Intuitive physics understanding emerges "
@@ -1560,7 +1156,7 @@ def api_server():
 
     @api.post(
         "/surprise/pipeline",
-        tags=["SurPrise — Hallucination Scoring"],
+        tags=["SurPrise — VoE Scoring"],
         summary="Full SurPrise pipeline: upload → preprocess → encode → score",
         description=(
             "All-in-one endpoint. Upload a video and immediately get its "
